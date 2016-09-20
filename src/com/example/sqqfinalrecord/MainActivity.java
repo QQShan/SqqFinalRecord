@@ -60,9 +60,9 @@ public class MainActivity extends Activity implements Callback{
 			public void onClick(View v) {
 				// TODO Auto-generated method stub
 				Log.d(TAG, "onclick");
+				recording = false;
 				FfmpegHelper.flush();
 				FfmpegHelper.close();
-				recording = false;
 			}
 		});
 		

@@ -14,13 +14,15 @@
 #define LOGI(format, ...)  __android_log_print(ANDROID_LOG_INFO,  "sqqlog", format, ##__VA_ARGS__)
 
 AVBitStreamFilterContext* faacbsfc = NULL;
-AVFormatContext *ofmt_ctx;
+AVFormatContext *ofmt_ctx /*,*fmt_ctx*/;
 AVCodec* pCodec,*pCodec_a;
 AVCodecContext* pCodecCtx,*pCodecCtx_a;
 AVStream* video_st,*audio_st;
 AVPacket enc_pkt,enc_pkt_a;
 AVFrame *pFrameYUV,*pFrame;
+//AVAudioFifo *fifo;
 
+//int output_frame_size;
 char *filedir;
 int width = 600;
 int height = 800;
@@ -32,9 +34,6 @@ int yuv_height;
 int y_length;
 int uv_length;
 int64_t start_time;
-int aud_pts;
-int vid_pts;
-int frameSize = 0;
 
 int init_video(){
 	//编码器的初始化
@@ -50,7 +49,7 @@ int init_video(){
 	pCodecCtx->time_base.num = 1;
 	pCodecCtx->time_base.den = 30;
 	pCodecCtx->bit_rate = 800000;
-	pCodecCtx->gop_size = 250;
+	pCodecCtx->gop_size = 30;
 	/* Some formats want stream headers to be separate. */
 	if (ofmt_ctx->oformat->flags & AVFMT_GLOBALHEADER)
 		pCodecCtx->flags |= CODEC_FLAG_GLOBAL_HEADER;
@@ -60,8 +59,7 @@ int init_video(){
 	pCodecCtx->max_b_frames = 3;
 	// Set H264 preset and tune
 	AVDictionary *param = 0;
-	//av_dict_set(&param, "preset", "ultrafast", 0);
-	av_dict_set(&param, "preset", "veryfast", 0);
+	av_dict_set(&param, "preset", "ultrafast", 0);
 	av_dict_set(&param, "tune", "zerolatency", 0);
 
 	if (avcodec_open2(pCodecCtx, pCodec, &param) < 0){
@@ -91,10 +89,12 @@ int init_audio(){
 
 	pCodecCtx_a->channels = 2;
 
+	//pCodecCtx_a->channel_layout = av_get_default_channel_layout(2);
 	pCodecCtx_a->channel_layout = av_get_default_channel_layout(
 			pCodecCtx_a->channels);
 
 	pCodecCtx_a->sample_rate = 44100;//44100 8000
+	//pCodecCtx_a->sample_fmt = pCodec_a->sample_fmts[0];
 	pCodecCtx_a->sample_fmt = AV_SAMPLE_FMT_S16;
 	pCodecCtx_a->bit_rate = 64000;
 	pCodecCtx_a->time_base.num = 1;
@@ -117,6 +117,9 @@ int init_audio(){
 	audio_st->time_base.den = pCodecCtx_a->sample_rate;
 	audio_st->codec = pCodecCtx_a;
 
+	//fifo = av_audio_fifo_alloc(pCodecCtx_a->sample_fmt,pCodecCtx_a->channels,1);
+
+	//output_frame_size = pCodecCtx_a->frame_size;
 	return 0;
 }
 
@@ -128,9 +131,9 @@ int init_audio(){
 JNIEXPORT jint JNICALL Java_com_example_sqqfinalrecord_FfmpegHelper_init
   (JNIEnv *env, jclass cls, jbyteArray filename /*,jbyteArray path*/){
 
-	filedir = (char*)(*env)->GetByteArrayElements(env, filename, 0);
+	//filedir = (char*)(*env)->GetByteArrayElements(env, filename, 0);
 	//const char* out_path = "rtmp://10.0.3.114:1935/live/demo";
-	//const char* out_path = "rtmp://10.0.6.114:1935/live/demo";
+	const char* out_path = "rtmp://10.0.6.114:1935/live/demo";
 
 	yuv_width=width;
 	yuv_height=height;
@@ -141,7 +144,7 @@ JNIEXPORT jint JNICALL Java_com_example_sqqfinalrecord_FfmpegHelper_init
 	faacbsfc =  av_bitstream_filter_init("aac_adtstoasc");
 
 	//初始化输出格式上下文
-	avformat_alloc_output_context2(&ofmt_ctx, NULL, "flv", /*out_path*/filedir);
+	avformat_alloc_output_context2(&ofmt_ctx, NULL, "flv", out_path/*filedir*/);
 	if(init_video()!=0){
 		return -1;
 	}
@@ -150,7 +153,7 @@ JNIEXPORT jint JNICALL Java_com_example_sqqfinalrecord_FfmpegHelper_init
 		return -1;
 	}
 	//Open output URL,set before avformat_write_header() for muxing
-	if (avio_open(&ofmt_ctx->pb, filedir/*out_path*/, AVIO_FLAG_READ_WRITE) < 0){
+	if (avio_open(&ofmt_ctx->pb, /*filedir*/out_path, AVIO_FLAG_READ_WRITE) < 0){
 		LOGE("Failed to open output file!\n");
 		return -1;
 	}
@@ -187,6 +190,12 @@ JNIEXPORT jint JNICALL Java_com_example_sqqfinalrecord_FfmpegHelper_start
 		*(pFrameYUV->data[2]+i)=*(in+y_length+i*2);
 		*(pFrameYUV->data[1]+i)=*(in+y_length+i*2+1);
 	}
+	/*int y_size = pCodecCtx->width * pCodecCtx->height;
+
+	//pFrameYUV->pts = count;
+	pFrameYUV->data[0] = in;  //y
+	pFrameYUV->data[1] = in+ y_size;      // U
+	pFrameYUV->data[2] = in+ y_size*5/4;  // V*/
 
 	pFrameYUV->format = AV_PIX_FMT_YUV420P;
 	pFrameYUV->width = yuv_width;
@@ -213,34 +222,22 @@ JNIEXPORT jint JNICALL Java_com_example_sqqfinalrecord_FfmpegHelper_start
 
 		//Duration between 2 frames (us)两帧之间的时间间隔，这里的单位是微秒
 		int64_t calc_duration = (double)(AV_TIME_BASE)*(1 / av_q2d(r_framerate1));	//内部时间戳
-		//Parameters
-		/*vid_pts = framecnt*calc_duration;
-		enc_pkt.pts = av_rescale_q(framecnt*calc_duration, time_base_q, time_base);
-		enc_pkt.dts=enc_pkt.pts;
-		enc_pkt.duration = av_rescale_q(calc_duration, time_base_q, time_base);
-		enc_pkt.pos = -1;*/
 
+
+		//Parameters
 		int64_t timett = av_gettime();
 		int64_t now_time = timett - start_time;
-		vid_pts = now_time;
-		enc_pkt.pts = av_rescale_q(now_time, time_base_q, time_base);
+		enc_pkt.pts = av_rescale_q(now_time, time_base_q, time_base);;
 		enc_pkt.dts=enc_pkt.pts;
 		enc_pkt.duration = av_rescale_q(calc_duration, time_base_q, time_base);
-		enc_pkt.pos = -1;
 
-		/*int64_t pts_time = av_rescale_q(enc_pkt.pts,time_base,time_base_q);
-		int64_t nows_time = av_gettime() - start_time;
-		if((pts_time > nows_time) && (vid_pts + pts_time -nows_time)<aud_pts)
-			av_usleep(pts_time-nows_time);*/
-		/*if(vid_pts<aud_pts){
-			av_usleep(aud_pts-vid_pts);
-			LOGE("sleep %d",aud_pts-vid_pts);
-		}*/
+		enc_pkt.pos = -1;
 
 		ret = av_interleaved_write_frame(ofmt_ctx, &enc_pkt);
 		av_free_packet(&enc_pkt);
 
 	}
+
 	return 0;
 }
 
@@ -259,7 +256,6 @@ JNIEXPORT jint JNICALL Java_com_example_sqqfinalrecord_FfmpegHelper_startAudio
 
 	pFrame = av_frame_alloc();
 	pFrame->nb_samples = pCodecCtx_a->frame_size;
-	frameSize = pFrame->nb_samples;
 	pFrame->format = pCodecCtx_a->sample_fmt;
 	pFrame->channel_layout = pCodecCtx_a->channel_layout;
 	pFrame->sample_rate = pCodecCtx_a->sample_rate;
@@ -279,13 +275,13 @@ JNIEXPORT jint JNICALL Java_com_example_sqqfinalrecord_FfmpegHelper_startAudio
 	pFrame->data[0] = frame_buf;
 	(*env)->ReleaseByteArrayElements(env,au_data,in,0);
 
+
 	enc_pkt_a.data = NULL;
 	enc_pkt_a.size = 0;
 	av_init_packet(&enc_pkt_a);
-	nb_samples += pFrame->nb_samples;
-
 	ret = avcodec_encode_audio2(pCodecCtx_a,&enc_pkt_a,pFrame, &enc_got_frame);
 	av_frame_free(&pFrame);
+
 
 	if (enc_got_frame == 1){
 		LOGI("Succeed to encode audio frame: %5d\tsize:%5d\t bufsize:%5d\n ", framecnt_a, enc_pkt_a.size,size);
@@ -303,30 +299,18 @@ JNIEXPORT jint JNICALL Java_com_example_sqqfinalrecord_FfmpegHelper_startAudio
 		//Duration between 2 frames (us)两帧之间的时间间隔，这里的单位是微秒
 		int64_t calc_duration = (double)(AV_TIME_BASE)*(1 / av_q2d(r_framerate1));	//内部时间戳
 
+/*		enc_pkt_a.pts = av_rescale_q(nb_samples*calc_duration, time_base_q, time_base);
+		enc_pkt_a.dts=enc_pkt_a.pts;
+		enc_pkt_a.duration = av_rescale_q(calc_duration, time_base_q, time_base);*/
+
 		//Parameters
 		int64_t timett = av_gettime();
 		int64_t now_time = timett - start_time;
-		enc_pkt_a.pts = av_rescale_q(now_time, time_base_q, time_base);
-		//enc_pkt_a.pts = av_rescale_q(nb_samples*calc_duration, time_base_q, time_base);
+		enc_pkt_a.pts = av_rescale_q(now_time, time_base_q, time_base);;
 		enc_pkt_a.dts=enc_pkt_a.pts;
 		enc_pkt_a.duration = av_rescale_q(calc_duration, time_base_q, time_base);
+
 		enc_pkt_a.pos = -1;
-
-		//延时
-		/*if(now_time<nb_samples*calc_duration){
-			av_usleep(nb_samples*calc_duration - now_time);
-		}*/
-		/*aud_pts = now_time;
-		if(aud_pts<vid_pts){
-			av_usleep(vid_pts-aud_pts);
-			LOGE("sleep %d",vid_pts-aud_pts);
-		}*/
-		/*aud_pts = nb_samples*calc_duration;
-		int64_t pts_time = av_rescale_q(enc_pkt_a.pts,time_base,time_base_q);
-		int64_t now_time = av_gettime() - start_time;
-		if((pts_time > now_time) && (aud_pts + pts_time -now_time)<vid_pts)
-			av_usleep(pts_time-now_time);*/
-
 		ret = av_interleaved_write_frame(ofmt_ctx, &enc_pkt_a);
 		av_free_packet(&enc_pkt_a);
 	}
@@ -354,23 +338,22 @@ int flush_encoder(){
 			break;
 		}
 		LOGI("Flush Encoder: Succeed to encode 1 frame!\tsize:%5d\n", enc_pkt.size);
-		framecnt++;
 
 		//Write PTS
 		AVRational time_base = ofmt_ctx->streams[0]->time_base;//{ 1, 1000 };
-		AVRational r_framerate1 = { 30, 1 };
+		AVRational r_framerate1 = { 60, 2 };
 		AVRational time_base_q = { 1, AV_TIME_BASE };
 		//Duration between 2 frames (us)
 		int64_t calc_duration = (double)(AV_TIME_BASE)*(1 / av_q2d(r_framerate1));	//内部时间戳
-
 		//Parameters
-		int64_t timett = av_gettime();
-		int64_t now_time = timett - start_time;
-		enc_pkt.pts = av_rescale_q(now_time, time_base_q, time_base);
-		//enc_pkt.pts = av_rescale_q(framecnt*calc_duration, time_base_q, time_base);
+		enc_pkt.pts = av_rescale_q(framecnt*calc_duration, time_base_q, time_base);
 		enc_pkt.dts = enc_pkt.pts;
 		enc_pkt.duration = av_rescale_q(calc_duration, time_base_q, time_base);
+
+		//转换PTS/DTS（Convert PTS/DTS）
 		enc_pkt.pos = -1;
+		framecnt++;
+		ofmt_ctx->duration = enc_pkt.duration * framecnt;
 
 		/* mux encoded frame */
 		ret = av_interleaved_write_frame(ofmt_ctx, &enc_pkt);
@@ -404,7 +387,6 @@ int flush_encoder_a(){
 		}
 		LOGE("Flush Encoder: Succeed to encode 1 frame!\tsize:%5d\n", enc_pkt_a.size);
 
-		nb_samples += frameSize;
 		av_bitstream_filter_filter(faacbsfc, ofmt_ctx->streams[audio_st->index]->codec, NULL, &enc_pkt_a.data, &enc_pkt_a.size, enc_pkt_a.data, enc_pkt_a.size, 0);
 
 		//Write PTS
@@ -417,14 +399,21 @@ int flush_encoder_a(){
 		//Duration between 2 frames (us)两帧之间的时间间隔，这里的单位是微秒
 		int64_t calc_duration = (double)(AV_TIME_BASE)*(1 / av_q2d(r_framerate1));	//内部时间戳
 
+
 		//Parameters
 		int64_t timett = av_gettime();
 		int64_t now_time = timett - start_time;
-		enc_pkt_a.pts = av_rescale_q(now_time, time_base_q, time_base);
-		//enc_pkt_a.pts = av_rescale_q(nb_samples*calc_duration, time_base_q, time_base);
+		enc_pkt_a.pts = av_rescale_q(now_time, time_base_q, time_base);;
 		enc_pkt_a.dts=enc_pkt_a.pts;
 		enc_pkt_a.duration = av_rescale_q(calc_duration, time_base_q, time_base);
+/*		enc_pkt_a.pts = av_rescale_q(nb_samples*calc_duration, time_base_q, time_base);
+		enc_pkt_a.dts=enc_pkt_a.pts;
+		enc_pkt_a.duration = av_rescale_q(calc_duration, time_base_q, time_base);*/
+
 		enc_pkt_a.pos = -1;
+
+		framecnt_a++;
+		ofmt_ctx->duration = enc_pkt_a.duration * framecnt_a;
 
 		ret = av_interleaved_write_frame(ofmt_ctx, &enc_pkt_a);
 		if (ret < 0)
@@ -443,7 +432,6 @@ JNIEXPORT jint JNICALL Java_com_example_sqqfinalrecord_FfmpegHelper_flush
 	flush_encoder();
 	flush_encoder_a();
 
-	LOGE("Flush end\n");
 	//Write file trailer
 	av_write_trailer(ofmt_ctx);
 	return 0;
